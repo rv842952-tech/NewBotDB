@@ -1,0 +1,411 @@
+"""
+db.py  ─  Shared PostgreSQL layer for all bot instances
+────────────────────────────────────────────────────────
+• One connection pool shared across every bot process
+  that imports this module.
+• Every public function is tenant-scoped: it takes bot_id
+  as its first argument and ALWAYS filters by it.
+• Schema is created once with IF NOT EXISTS — safe for
+  concurrent first-starts across many bot processes.
+
+ISOLATION GUARANTEES
+────────────────────
+1. Foreign key  bot_tenants(bot_id) → posts/channels ON DELETE CASCADE
+   Deleting a tenant wipes all its data and nothing else.
+2. Every SELECT / UPDATE / DELETE carries WHERE bot_id = %s.
+   Postgres will never return another tenant's rows even on a
+   bug — the planner simply finds no matching pages.
+3. UNIQUE constraints are (bot_id, channel_id) — not just
+   channel_id — so two bots can target the same channel
+   independently.
+4. The connection pool uses autocommit=False + explicit
+   SAVEPOINT per operation, so a crash inside one bot's
+   transaction rolls back only that transaction; other bots'
+   in-flight transactions are untouched.
+"""
+
+import hashlib
+import logging
+import os
+from contextlib import contextmanager
+
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────
+# Connection pool  (module-level singleton)
+# ─────────────────────────────────────────────────────────
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+
+
+def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10):
+    """Call once at startup in each process."""
+    global _pool
+    _pool = psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, database_url)
+    logger.info(f"✅ DB pool ready (min={minconn}, max={maxconn})")
+
+
+@contextmanager
+def get_conn():
+    """
+    Yield a pooled connection.
+    Commits on clean exit, rolls back on exception.
+    Always returns the connection to the pool.
+    """
+    if _pool is None:
+        raise RuntimeError("Call db.init_pool() before using get_conn()")
+    conn = _pool.getconn()
+    # Reset connection state — guards against a previously aborted transaction
+    # being silently reused from the pool.
+    try:
+        if conn.closed:
+            _pool.putconn(conn, close=True)
+            conn = _pool.getconn()
+        conn.autocommit = False
+        # If the connection is in an error state, roll it back before use
+        if conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
+            conn.rollback()
+    except Exception:
+        _pool.putconn(conn)
+        raise
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _pool.putconn(conn)
+
+
+def _cur(conn):
+    """RealDictCursor — rows behave like dicts."""
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def _raw(conn):
+    return conn.cursor()
+
+
+# ─────────────────────────────────────────────────────────
+# bot_id derivation
+# ─────────────────────────────────────────────────────────
+def make_bot_id(token: str) -> str:
+    """
+    Derive a stable, opaque 16-char identifier from a bot token.
+    Never stored raw; never reversible.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+# ─────────────────────────────────────────────────────────
+# Schema bootstrap  (idempotent — safe to call every start)
+# ─────────────────────────────────────────────────────────
+_SCHEMA_SQL = """
+-- Master tenant registry
+CREATE TABLE IF NOT EXISTS bot_tenants (
+    bot_id      TEXT        PRIMARY KEY,
+    bot_type    TEXT        NOT NULL DEFAULT 'unknown',
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Scheduler posts  (owned by scheduler bots)
+CREATE TABLE IF NOT EXISTS posts (
+    id               BIGSERIAL   PRIMARY KEY,
+    bot_id           TEXT        NOT NULL
+                                 REFERENCES bot_tenants(bot_id)
+                                 ON DELETE CASCADE,
+    message          TEXT,
+    media_type       TEXT,
+    media_file_id    TEXT,
+    caption          TEXT,
+    scheduled_time   TIMESTAMPTZ NOT NULL,
+    posted           BOOLEAN     DEFAULT FALSE,
+    total_channels   INT         DEFAULT 0,
+    successful_posts INT         DEFAULT 0,
+    posted_at        TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Target channels  (shared by both bot types)
+CREATE TABLE IF NOT EXISTS channels (
+    id             BIGSERIAL   PRIMARY KEY,
+    bot_id         TEXT        NOT NULL
+                               REFERENCES bot_tenants(bot_id)
+                               ON DELETE CASCADE,
+    channel_id     TEXT        NOT NULL,
+    channel_name   TEXT,
+    added_at       TIMESTAMPTZ DEFAULT NOW(),
+    active         BOOLEAN     DEFAULT TRUE,
+    total_forwards BIGINT      DEFAULT 0,
+    last_forward   TIMESTAMPTZ,
+    UNIQUE (bot_id, channel_id)          -- two bots can share same target
+);
+
+-- Copy-bot forward history  (owned by forwarder bots)
+CREATE TABLE IF NOT EXISTS forward_log (
+    id              BIGSERIAL   PRIMARY KEY,
+    bot_id          TEXT        NOT NULL
+                                REFERENCES bot_tenants(bot_id)
+                                ON DELETE CASCADE,
+    message_id      BIGINT,
+    msg_type        TEXT,
+    total_channels  INT         DEFAULT 0,
+    successful      INT         DEFAULT 0,
+    failed          INT         DEFAULT 0,
+    duration_sec    REAL,
+    forwarded_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_posts_due
+    ON posts (bot_id, scheduled_time, posted)
+    WHERE posted = FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_channels_active
+    ON channels (bot_id, active)
+    WHERE active = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_fwdlog_bot
+    ON forward_log (bot_id, forwarded_at DESC);
+"""
+
+
+def bootstrap_schema():
+    """Create all tables if they don't exist. Safe to call concurrently."""
+    with get_conn() as conn:
+        conn.cursor().execute(_SCHEMA_SQL)
+    logger.info("✅ Schema bootstrapped")
+
+
+def register_tenant(bot_id: str, bot_type: str):
+    """
+    Insert this bot into bot_tenants, or update its type if already there.
+    bot_type: 'scheduler' | 'forwarder'
+    """
+    with get_conn() as conn:
+        _raw(conn).execute("""
+            INSERT INTO bot_tenants (bot_id, bot_type)
+            VALUES (%s, %s)
+            ON CONFLICT (bot_id) DO UPDATE SET bot_type = EXCLUDED.bot_type
+        """, (bot_id, bot_type))
+    logger.info(f"🤖 Tenant registered: bot_id={bot_id} type={bot_type}")
+
+
+# ─────────────────────────────────────────────────────────
+# CHANNEL  operations  (used by both bot types)
+# ─────────────────────────────────────────────────────────
+
+def channel_add(bot_id: str, channel_id: str, channel_name: str | None = None) -> bool:
+    with get_conn() as conn:
+        _raw(conn).execute("""
+            INSERT INTO channels (bot_id, channel_id, channel_name, active)
+            VALUES (%s, %s, %s, TRUE)
+            ON CONFLICT (bot_id, channel_id)
+            DO UPDATE SET
+                active       = TRUE,
+                channel_name = COALESCE(EXCLUDED.channel_name, channels.channel_name)
+        """, (bot_id, channel_id, channel_name))
+    return True
+
+
+def channel_remove(bot_id: str, channel_id: str) -> bool:
+    with get_conn() as conn:
+        cur = _raw(conn)
+        cur.execute(
+            "UPDATE channels SET active=FALSE WHERE bot_id=%s AND channel_id=%s",
+            (bot_id, channel_id)
+        )
+        return cur.rowcount > 0
+
+
+def channel_list_active(bot_id: str) -> list[str]:
+    with get_conn() as conn:
+        cur = _cur(conn)
+        cur.execute(
+            "SELECT channel_id FROM channels WHERE bot_id=%s AND active=TRUE ORDER BY channel_id",
+            (bot_id,)
+        )
+        return [r['channel_id'] for r in cur.fetchall()]
+
+
+def channel_list_all(bot_id: str) -> list[dict]:
+    with get_conn() as conn:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT channel_id, channel_name, added_at,
+                   active, total_forwards, last_forward
+            FROM   channels
+            WHERE  bot_id = %s
+            ORDER  BY added_at DESC
+        """, (bot_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def channel_increment_forward(bot_id: str, channel_id: str):
+    """Bump forward counter for one channel — called per successful copy."""
+    with get_conn() as conn:
+        _raw(conn).execute("""
+            UPDATE channels
+            SET    total_forwards = total_forwards + 1,
+                   last_forward   = NOW()
+            WHERE  bot_id = %s AND channel_id = %s
+        """, (bot_id, channel_id))
+
+
+# ─────────────────────────────────────────────────────────
+# POSTS  operations  (scheduler bot only)
+# ─────────────────────────────────────────────────────────
+
+def post_insert(bot_id: str, scheduled_time, total_channels: int,
+                message=None, media_type=None,
+                media_file_id=None, caption=None) -> int:
+    with get_conn() as conn:
+        cur = _raw(conn)
+        cur.execute("""
+            INSERT INTO posts
+                (bot_id, message, media_type, media_file_id,
+                 caption, scheduled_time, total_channels)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """, (bot_id, message, media_type, media_file_id,
+              caption, scheduled_time, total_channels))
+        return cur.fetchone()[0]
+
+
+def post_get_due(bot_id: str, limit: int = 200) -> list[dict]:
+    """Fetch posts whose scheduled_time has passed and haven't been posted."""
+    with get_conn() as conn:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT * FROM posts
+            WHERE  bot_id = %s
+              AND  scheduled_time <= NOW()
+              AND  posted = FALSE
+            ORDER  BY scheduled_time
+            LIMIT  %s
+        """, (bot_id, limit))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def post_mark_sent(bot_id: str, post_id: int, successful: int):
+    with get_conn() as conn:
+        _raw(conn).execute("""
+            UPDATE posts
+            SET    posted = TRUE,
+                   posted_at = NOW(),
+                   successful_posts = %s
+            WHERE  id = %s AND bot_id = %s
+        """, (successful, post_id, bot_id))
+
+
+def post_get_pending(bot_id: str) -> list[dict]:
+    with get_conn() as conn:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT * FROM posts
+            WHERE  bot_id = %s AND posted = FALSE
+            ORDER  BY scheduled_time
+        """, (bot_id,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def post_delete(bot_id: str, post_id: int) -> bool:
+    with get_conn() as conn:
+        cur = _raw(conn)
+        cur.execute(
+            "DELETE FROM posts WHERE id=%s AND bot_id=%s",
+            (post_id, bot_id)
+        )
+        return cur.rowcount > 0
+
+
+def post_delete_pending_all(bot_id: str) -> int:
+    with get_conn() as conn:
+        cur = _raw(conn)
+        cur.execute(
+            "DELETE FROM posts WHERE bot_id=%s AND posted=FALSE",
+            (bot_id,)
+        )
+        return cur.rowcount
+
+
+def post_cleanup_old(bot_id: str, minutes: int) -> int:
+    """Delete posted records older than `minutes` minutes."""
+    with get_conn() as conn:
+        cur = _raw(conn)
+        cur.execute(
+            f"""
+            DELETE FROM posts
+            WHERE  bot_id   = %s
+              AND  posted    = TRUE
+              AND  posted_at < NOW() - INTERVAL '{int(minutes)} minutes'
+            """,
+            (bot_id,)
+        )
+        return cur.rowcount
+
+
+def post_stats(bot_id: str) -> dict:
+    with get_conn() as conn:
+        cur = _raw(conn)
+        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s", (bot_id,))
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted=FALSE", (bot_id,))
+        pending = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted=TRUE", (bot_id,))
+        done = cur.fetchone()[0]
+    return {'total': total, 'pending': pending, 'posted': done}
+
+
+def post_get_last(bot_id: str) -> dict | None:
+    """Return the most recently posted post for this bot, or None."""
+    with get_conn() as conn:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT *
+            FROM   posts
+            WHERE  bot_id = %s AND posted = TRUE
+            ORDER  BY posted_at DESC
+            LIMIT  1
+        """, (bot_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+# ─────────────────────────────────────────────────────────
+# FORWARD LOG  operations  (forwarder bot only)
+# ─────────────────────────────────────────────────────────
+
+def fwdlog_insert(bot_id: str, message_id: int, msg_type: str,
+                  total: int, successful: int, failed: int, duration: float):
+    with get_conn() as conn:
+        _raw(conn).execute("""
+            INSERT INTO forward_log
+                (bot_id, message_id, msg_type, total_channels,
+                 successful, failed, duration_sec)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (bot_id, message_id, msg_type, total, successful, failed, duration))
+
+
+def fwdlog_stats(bot_id: str) -> dict:
+    """Aggregate stats for the /stats command."""
+    with get_conn() as conn:
+        cur = _cur(conn)
+        cur.execute("""
+            SELECT
+                COUNT(*)                        AS messages_processed,
+                COALESCE(SUM(total_channels),0) AS total_forwards,
+                COALESCE(SUM(successful),0)     AS successful_forwards,
+                COALESCE(SUM(failed),0)         AS failed_forwards,
+                MAX(forwarded_at)               AS last_forward_time
+            FROM forward_log
+            WHERE bot_id = %s
+        """, (bot_id,))
+        return dict(cur.fetchone())
