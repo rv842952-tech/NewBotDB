@@ -142,6 +142,13 @@ def get_batch_size_keyboard():
         [KeyboardButton("❌ Cancel")],
     ], resize_keyboard=True)
 
+def get_batch_type_keyboard():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📊 Normal Batch")],
+        [KeyboardButton("⚡ Auto-Continuous")],
+        [KeyboardButton("❌ Cancel")],
+    ], resize_keyboard=True)
+
 def get_days_keyboard():
     return ReplyKeyboardMarkup([
         [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
@@ -520,6 +527,54 @@ async def _schedule_batch(update, session):
 
 
 
+async def _schedule_autocont(update, session):
+    """Auto-Continuous scheduler - fixed interval between batches."""
+    posts = session['posts']
+    batch_size = session['batch_size']
+    interval_minutes = session['interval_minutes']
+    start_utc = session['auto_start_time_utc']
+    
+    n = len(posts)
+    num_batches = (n + batch_size - 1) // batch_size
+    info = []
+    
+    for i, p in enumerate(posts):
+        batch_number = i // batch_size
+        post_in_batch = i % batch_size
+        batch_time = start_utc + timedelta(minutes=interval_minutes * batch_number)
+        t = batch_time + timedelta(seconds=post_in_batch * 2)
+        pid = db.post_insert(BOT_ID, t, len(channel_ids),
+                             p.get('message'), p.get('media_type'),
+                             p.get('media_file_id'), p.get('caption'))
+        info.append((pid, t, batch_number + 1))
+    
+    h, m = divmod(interval_minutes, 60)
+    interval_display = f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m}m")
+    
+    resp = (f"✅ <b>AUTO-CONTINUOUS SCHEDULED!</b>\n\n"
+            f"📦 {n} posts  🎯 {batch_size}/batch  📊 {num_batches} batches\n"
+            f"⏱️ Interval: every {interval_display}\n"
+            f"📢 {len(channel_ids)} channels\n\n"
+            f"<b>Batch preview:</b>\n")
+    
+    cur_b = 0
+    shown = 0
+    for pid, t, bn in info:
+        if shown >= 10:
+            resp += f"<i>...and {len(info)-shown} more</i>"
+            break
+        if bn != cur_b:
+            if cur_b:
+                resp += "\n"
+            resp += f"<b>Batch #{bn}</b> {utc_to_ist(t).strftime('%H:%M')} IST:\n"
+            cur_b = bn
+        resp += f"  • #{pid}\n"
+        shown += 1
+    
+    resp += f"\n💡 Add more posts anytime — they'll continue from Batch #{num_batches + 1}"
+    await update.message.reply_text(resp, reply_markup=get_mode_keyboard(), parse_mode='HTML')
+
+
 async def _schedule_multiday(update, session):
     """Schedule posts across multiple days within a daily time window."""
     posts       = session['posts']
@@ -613,11 +668,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif "🎯 Bulk" in text:
             if _no_ch():
                 await update.message.reply_text("❌ Add a channel first.", reply_markup=get_mode_keyboard()); return
-            sess.update(mode='batch', step='batch_get_start_time', posts=[])
+            sess.update(mode='batch', step='batch_choose_type', posts=[])
             await update.message.reply_text(
-                f"🎯 <b>BATCH MODE</b>\n🕐 Now: <b>{get_ist_now().strftime('%H:%M:%S')} IST</b>\n\n"
-                "When should the first batch go out?",
-                reply_markup=get_exact_time_keyboard(), parse_mode='HTML')
+                f"🎯 <b>BATCH MODE</b>\n\n"
+                "Choose batch scheduling type:",
+                reply_markup=get_batch_type_keyboard(), parse_mode='HTML')
 
         elif "📆 Multi-Day" in text:
             if _no_ch():
@@ -713,6 +768,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ════ BATCH ══════════════════════════════
     elif sess['mode'] == 'batch':
 
+        if sess['step'] == 'batch_choose_type':
+            if "📊 Normal" in text:
+                sess['batch_type'] = 'normal'
+                sess['step'] = 'batch_get_start_time'
+                await update.message.reply_text(
+                    f"📊 <b>NORMAL BATCH</b>\n🕐 Now: <b>{get_ist_now().strftime('%H:%M:%S')} IST</b>\n\n"
+                    "When should the first batch go out?",
+                    reply_markup=get_exact_time_keyboard(), parse_mode='HTML')
+            elif "⚡ Auto-Continuous" in text:
+                sess['batch_type'] = 'autocont'
+                sess['step'] = 'autocont_get_start'
+                last = db.post_get_last(BOT_ID)
+                if last:
+                    last_ist = utc_to_ist(last['scheduled_time'])
+                    hint = f"\n\n💡 Last post: <b>{last_ist.strftime('%Y-%m-%d %H:%M')} IST</b>\nYou can start after it."
+                else:
+                    hint = ""
+                await update.message.reply_text(
+                    f"⚡ <b>AUTO-CONTINUOUS BATCHES</b>\n"
+                    f"🕐 Now: <b>{get_ist_now().strftime('%H:%M:%S')} IST</b>{hint}\n\n"
+                    "When should the first batch go out?\n"
+                    "<code>now  30m  2h  today 20:00  tomorrow 9am</code>",
+                    reply_markup=get_exact_time_keyboard(), parse_mode='HTML')
+            else:
+                await update.message.reply_text("Choose batch type:", reply_markup=get_batch_type_keyboard())
+            return
+
         if sess['step'] == 'batch_get_start_time':
             try:
                 ist = parse_user_time_input(text)
@@ -773,6 +855,104 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_sessions[uid] = {'mode': None, 'step': 'choose_mode'}
             else:
                 await update.message.reply_text("⚠️ Click Confirm or Cancel.", reply_markup=get_confirmation_keyboard())
+            return
+
+        # ════ AUTO-CONTINUOUS SUB-MODE ═══════
+        if sess['step'] == 'autocont_get_start':
+            try:
+                ist = parse_user_time_input(text)
+                sess['auto_start_time_utc'] = ist_to_utc(ist)
+                sess['step'] = 'autocont_get_interval'
+                await update.message.reply_text(
+                    f"✅ First batch: <b>{ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n\n"
+                    "How long between each batch?\n"
+                    "<code>30m  1h  2h  3h  6h  12h</code>",
+                    reply_markup=get_duration_keyboard(), parse_mode='HTML')
+            except ValueError as e:
+                await update.message.reply_text(f"❌ {e}", reply_markup=get_exact_time_keyboard())
+            return
+
+        if sess['step'] == 'autocont_get_interval':
+            try:
+                interval = parse_duration_to_minutes(text)
+                if interval < 1:
+                    raise ValueError("Interval must be at least 1 minute")
+                sess['interval_minutes'] = interval
+                sess['step'] = 'autocont_get_batch_size'
+                h, m = divmod(interval, 60)
+                interval_display = f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m}m")
+                await update.message.reply_text(
+                    f"✅ Interval: <b>{interval_display}</b> between batches\n\n"
+                    "How many posts per batch?",
+                    reply_markup=get_batch_size_keyboard(), parse_mode='HTML')
+            except ValueError as e:
+                await update.message.reply_text(f"❌ {e}", reply_markup=get_duration_keyboard())
+            return
+
+        if sess['step'] == 'autocont_get_batch_size':
+            try:
+                bs = int(text.strip())
+                if bs < 1:
+                    raise ValueError
+                sess['batch_size'] = bs
+                sess['step'] = 'autocont_collect_posts'
+                interval = sess['interval_minutes']
+                start_ist = utc_to_ist(sess['auto_start_time_utc'])
+                h, m = divmod(interval, 60)
+                interval_display = f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m}m")
+                await update.message.reply_text(
+                    f"✅ <b>Auto-Continuous Setup:</b>\n"
+                    f"🕐 First batch: <b>{start_ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n"
+                    f"⏱️ Interval: <b>{interval_display}</b>\n"
+                    f"🎯 Batch size: <b>{bs} posts</b>\n\n"
+                    "Now send all your posts. Click Done when finished.",
+                    reply_markup=get_bulk_collection_keyboard(), parse_mode='HTML')
+            except ValueError:
+                await update.message.reply_text("❌ Enter a number.", reply_markup=get_batch_size_keyboard())
+            return
+
+        if sess['step'] == 'autocont_collect_posts':
+            if "✅ Done" in text:
+                if not sess.get('posts'):
+                    await update.message.reply_text(
+                        "❌ Send at least one post.", reply_markup=get_bulk_collection_keyboard()); return
+                n = len(sess['posts'])
+                bs = sess['batch_size']
+                interval = sess['interval_minutes']
+                nb = (n + bs - 1) // bs
+                start_ist = utc_to_ist(sess['auto_start_time_utc'])
+                h, m = divmod(interval, 60)
+                interval_display = f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m}m")
+                end_utc = sess['auto_start_time_utc'] + timedelta(minutes=interval * (nb - 1))
+                end_ist = utc_to_ist(end_utc)
+                sess['step'] = 'autocont_confirm'
+                await update.message.reply_text(
+                    f"📋 <b>CONFIRM AUTO-CONTINUOUS</b>\n\n"
+                    f"📦 Total posts:  <b>{n}</b>\n"
+                    f"🎯 Batch size:   <b>{bs}</b>\n"
+                    f"📊 Batches:      <b>{nb}</b>\n"
+                    f"⏱️ Interval:     <b>{interval_display}</b>\n"
+                    f"🕐 First batch:  <b>{start_ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n"
+                    f"🏁 Last batch:   <b>{end_ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n"
+                    f"📢 Channels:     <b>{len(channel_ids)}</b>\n\n"
+                    f"⚠️ Click Confirm to schedule.",
+                    reply_markup=get_confirmation_keyboard(), parse_mode='HTML')
+                return
+            c = extract_content(update.message)
+            if c:
+                sess.setdefault('posts', []).append(c)
+                await update.message.reply_text(
+                    f"✅ Post #{len(sess['posts'])} added! Send more or Done.",
+                    reply_markup=get_bulk_collection_keyboard(), parse_mode='HTML')
+            return
+
+        if sess['step'] == 'autocont_confirm':
+            if "✅ Confirm" in text:
+                await _schedule_autocont(update, sess)
+                user_sessions[uid] = {'mode': None, 'step': 'choose_mode'}
+            else:
+                await update.message.reply_text(
+                    "⚠️ Click Confirm or Cancel.", reply_markup=get_confirmation_keyboard())
             return
 
     # ════ MULTI-DAY BATCH ════════════════════
@@ -841,32 +1021,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if h == sess['window_start_hour']:
                     raise ValueError("End time cannot be same as start time")
                 sess['window_end_hour'] = h
-                sess['step'] = 'multiday_get_days'
+                sess['step'] = 'multiday_get_batch_size'
                 start_h = sess['window_start_hour']
                 wm = (h - start_h) * 60 if h > start_h else (24 - start_h + h) * 60
                 await update.message.reply_text(
                     f"✅ Window: <b>{start_h:02d}:00 - {h:02d}:00 IST</b>  ({wm} min)\n\n"
-                    "How many days to schedule for?",
-                    reply_markup=get_days_keyboard(), parse_mode='HTML')
+                    "How many posts per batch?",
+                    reply_markup=get_batch_size_keyboard(), parse_mode='HTML')
             except ValueError as e:
                 await update.message.reply_text(f"❌ {e}", reply_markup=ReplyKeyboardMarkup([
                     [KeyboardButton("01:00"), KeyboardButton("00:00"), KeyboardButton("23:00")],
                     [KeyboardButton("❌ Cancel")],
                 ], resize_keyboard=True))
-            return
-
-        if sess['step'] == 'multiday_get_days':
-            try:
-                days = int(text.strip())
-                if days < 1 or days > 365:
-                    raise ValueError("Days must be between 1 and 365")
-                sess['multiday_days'] = days
-                sess['step'] = 'multiday_get_batch_size'
-                await update.message.reply_text(
-                    f"✅ Days: <b>{days}</b>\n\nHow many posts per batch?",
-                    reply_markup=get_batch_size_keyboard(), parse_mode='HTML')
-            except ValueError as e:
-                await update.message.reply_text(f"❌ {e}", reply_markup=get_days_keyboard())
             return
 
         if sess['step'] == 'multiday_get_batch_size':
@@ -876,11 +1042,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError
                 sess['batch_size'] = bs
                 sess['step'] = 'multiday_collect_posts'
-                days = sess['multiday_days']
                 await update.message.reply_text(
                     f"✅ Batch size: <b>{bs}</b>\n\n"
                     f"Now send all your posts.\n"
-                    f"For <b>{days} days</b> I recommend at least <b>{bs * days}</b> posts ({bs} per day).\n\n"
+                    f"Send as many as you want - bot will auto-calculate days needed.\n\n"
                     "Click <b>Done</b> when finished.",
                     reply_markup=get_bulk_collection_keyboard(), parse_mode='HTML')
             except ValueError:
@@ -894,8 +1059,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "❌ Send at least one post.", reply_markup=get_bulk_collection_keyboard()); return
                 
                 n = len(sess['posts'])
-                days = sess['multiday_days']
                 bs = sess['batch_size']
+                # Auto-calculate days based on posts
+                days = max(1, (n + bs - 1) // bs)  # Ceiling division
+                sess['multiday_days'] = days
                 sh = sess['window_start_hour']
                 eh = sess['window_end_hour']
                 wm = (eh - sh) * 60 if eh > sh else (24 - sh + eh) * 60
