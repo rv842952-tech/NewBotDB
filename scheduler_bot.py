@@ -175,9 +175,10 @@ def parse_hour(text: str) -> int:
 def parse_user_time_input(text: str) -> datetime:
     text = text.strip().lower()
     now = get_ist_now()
-    if text == 'now': return now
-    # Check word-based prefixes BEFORE suffix checks — 'today' ends with 'd'
-    # and would wrongly match the endswith('d') branch otherwise.
+    if text == 'now':      return now
+    if text.endswith('m'): return now + timedelta(minutes=int(text[:-1]))
+    if text.endswith('h'): return now + timedelta(hours=int(text[:-1]))
+    if text.endswith('d'): return now + timedelta(days=int(text[:-1]))
     if text.startswith('tomorrow'):
         tp = text.replace('tomorrow', '').strip()
         base = (now + timedelta(days=1)).date()
@@ -187,9 +188,6 @@ def parse_user_time_input(text: str) -> datetime:
         tp = text.replace('today', '').strip()
         h = parse_hour(tp) if tp else 0
         return datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=h)
-    if text.endswith('m'): return now + timedelta(minutes=int(text[:-1]))
-    if text.endswith('h'): return now + timedelta(hours=int(text[:-1]))
-    if text.endswith('d'): return now + timedelta(days=int(text[:-1]))
     for fmt in ('%Y-%m-%d %H:%M', '%m/%d %H:%M', '%d/%m %H:%M'):
         try:
             return datetime.strptime(text, fmt)
@@ -256,11 +254,8 @@ async def send_to_all_channels(bot, post: dict) -> int:
 
     batch_size = 20
     for i in range(0, len(channel_ids), batch_size):
-        results = await asyncio.gather(
-            *[_send(ch) for ch in channel_ids[i:i+batch_size]],
-            return_exceptions=True
-        )
-        successful += sum(1 for r in results if r is True)
+        results = await asyncio.gather(*[_send(ch) for ch in channel_ids[i:i+batch_size]])
+        successful += sum(results)
         if i + batch_size < len(channel_ids):
             await asyncio.sleep(2.0)
 
@@ -270,8 +265,6 @@ async def send_to_all_channels(bot, post: dict) -> int:
 
 
 async def process_due_posts(bot):
-    if posting_lock is None:
-        return  # called before main() finished — skip safely
     async with posting_lock:
         posts = db.post_get_due(BOT_ID, limit=200)
         for post in posts:
@@ -373,7 +366,7 @@ async def list_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hasattr(t, 'tzinfo') and t.tzinfo:
             t = t.replace(tzinfo=None)
         ist = utc_to_ist(t)
-        content = p['message'] or p['caption'] or f"[{p['media_type'] or 'unknown'}]"
+        content = p['message'] or p['caption'] or f"[{p['media_type']}]"
         preview = content[:25] + "…" if len(content) > 25 else content
         resp += f"🆔 {p['id']} — {ist.strftime('%m/%d %H:%M')} IST\n   {preview}\n\n"
     if len(posts) > 10:
@@ -413,11 +406,31 @@ async def export_channels_command(update: Update, context: ContextTypes.DEFAULT_
     chs = db.channel_list_all(BOT_ID)
     if not chs:
         await update.message.reply_text("No channels.", reply_markup=get_mode_keyboard()); return
-    cmds = [f"/addchannel {c['channel_id']}" + (f" {c['channel_name']}" if c['channel_name'] else "")
-            for c in chs if c['active']]
+    
+    active_chs = [c for c in chs if c['active']]
+    
+    # Send header
     await update.message.reply_text(
-        "🔖 <b>CHANNEL BACKUP</b>\n\n<code>" + "\n".join(cmds) + f"</code>\n\n{len(cmds)} channels",
-        parse_mode='HTML', reply_markup=get_mode_keyboard())
+        f"📤 <b>EXPORTING {len(active_chs)} CHANNELS</b>\n\n"
+        f"⬇️ Forward each message back to bot to restore\n"
+        f"💡 Select all → Forward",
+        parse_mode='HTML')
+    
+    # Send each command separately
+    for c in active_chs:
+        cmd = f"/addchannel {c['channel_id']}"
+        if c['channel_name']:
+            cmd += f" {c['channel_name']}"
+        await update.message.reply_text(cmd)
+        await asyncio.sleep(0.2)  # Avoid flood
+    
+    # Send footer
+    await update.message.reply_text(
+        f"✅ <b>Exported {len(active_chs)} channels!</b>\n\n"
+        f"Select all commands above and forward to bot to restore",
+        parse_mode='HTML',
+        reply_markup=get_mode_keyboard()
+    )
 
 async def backup_posts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update): return
@@ -435,71 +448,6 @@ async def backup_posts_command(update: Update, context: ContextTypes.DEFAULT_TYP
         elif p['media_type']: text += f"   [{p['media_type']}]\n"
         text += "\n"
     await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_mode_keyboard())
-
-
-async def lastpost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update): return
-
-    post = db.post_get_last(BOT_ID)
-
-    if not post:
-        await update.message.reply_text(
-            "📭 <b>No posts have been sent yet.</b>\n\n"
-            "Once a scheduled post is delivered it will appear here.",
-            reply_markup=get_mode_keyboard(), parse_mode='HTML'
-        )
-        return
-
-    # Normalise timezone-aware timestamps from Postgres → naive for utc_to_ist()
-    def _to_naive(dt):
-        if dt is None: return None
-        return dt.replace(tzinfo=None) if hasattr(dt, 'tzinfo') and dt.tzinfo else dt
-
-    posted_at_utc  = _to_naive(post['posted_at'])
-    scheduled_utc  = _to_naive(post['scheduled_time'])
-    created_utc    = _to_naive(post['created_at'])
-
-    posted_ist    = utc_to_ist(posted_at_utc)  if posted_at_utc  else None
-    scheduled_ist = utc_to_ist(scheduled_utc)  if scheduled_utc  else None
-    created_ist   = utc_to_ist(created_utc)    if created_utc    else None
-
-    # Build content preview
-    if post['message']:
-        content_type = "💬 Text"
-        preview = post['message'][:200] + ("…" if len(post['message']) > 200 else "")
-    elif post['media_type']:
-        icons = {'photo': '🖼️', 'video': '🎬', 'document': '📎'}
-        content_type = f"{icons.get(post['media_type'], '📎')} {post['media_type'].capitalize()}"
-        preview = post['caption'][:200] if post['caption'] else "(no caption)"
-    else:
-        content_type = "❓ Unknown"
-        preview = "(no content)"
-
-    # Delay: how late / early was the actual post vs scheduled
-    delay_str = ""
-    if posted_at_utc and scheduled_utc:
-        delay_sec = (posted_at_utc - scheduled_utc).total_seconds()
-        if abs(delay_sec) < 60:
-            delay_str = f"~{int(abs(delay_sec))}s {'late' if delay_sec > 0 else 'early'}"
-        else:
-            delay_str = f"~{int(abs(delay_sec)//60)}m {'late' if delay_sec > 0 else 'early'}"
-
-    text = (
-        f"📬 <b>LAST POSTED</b>\n\n"
-        f"🆔 Post ID:      <code>{post['id']}</code>\n"
-        f"📝 Type:         {content_type}\n"
-        f"📤 Posted at:    <b>{posted_ist.strftime('%Y-%m-%d %H:%M:%S') if posted_ist else 'N/A'} IST</b>\n"
-        f"📅 Scheduled:    {scheduled_ist.strftime('%Y-%m-%d %H:%M:%S') if scheduled_ist else 'N/A'} IST\n"
-        f"🕐 Created:      {created_ist.strftime('%Y-%m-%d %H:%M:%S') if created_ist else 'N/A'} IST\n"
-    )
-    if delay_str:
-        text += f"⏱️ Delivery:     {delay_str}\n"
-    text += (
-        f"📢 Channels:     {post['successful_posts']} / {post['total_channels']} successful\n\n"
-        f"<b>Content preview:</b>\n<i>{preview}</i>"
-    )
-
-    await update.message.reply_text(text, reply_markup=get_mode_keyboard(), parse_mode='HTML')
 
 
 # ─────────────────────────────────────────────
@@ -845,15 +793,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 async def background_poster(application: Application):
     bot  = application.bot
-    loop = asyncio.get_event_loop()
     tick = 0
     while True:
         try:
             await process_due_posts(bot)
             tick += 1
             if tick >= 2:
-                # Run blocking DB cleanup in a thread so the event loop stays free
-                await loop.run_in_executor(None, cleanup_posted_content)
+                cleanup_posted_content()
                 tick = 0
         except Exception as e:
             logger.error(f"Background error: {e}", exc_info=True)
@@ -915,7 +861,6 @@ def main():
     app.add_handler(CommandHandler("reset",          reset_command))
     app.add_handler(CommandHandler("exportchannels", export_channels_command))
     app.add_handler(CommandHandler("backup",         backup_posts_command))
-    app.add_handler(CommandHandler("lastpost",       lastpost_command))
     app.add_handler(MessageHandler(filters.ALL,      handle_message))
 
     logger.info("=" * 60)
