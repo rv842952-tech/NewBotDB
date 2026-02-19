@@ -27,6 +27,7 @@ ISOLATION GUARANTEES
 import hashlib
 import logging
 import os
+import time
 from contextlib import contextmanager
 
 import psycopg2
@@ -41,47 +42,84 @@ logger = logging.getLogger(__name__)
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
-def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10):
-    """Call once at startup in each process."""
+def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10,
+              retries: int = 5):
+    """
+    Connect to PostgreSQL with retry logic.
+    Retries up to `retries` times with increasing delays before giving up.
+    Handles brief database unavailability on startup or after a hiccup.
+    """
     global _pool
-    _pool = psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, database_url)
-    logger.info(f"✅ DB pool ready (min={minconn}, max={maxconn})")
+    for attempt in range(retries):
+        try:
+            _pool = psycopg2.pool.ThreadedConnectionPool(minconn, maxconn, database_url)
+            logger.info(f"✅ DB pool ready (min={minconn}, max={maxconn})")
+            return
+        except Exception as e:
+            wait = (attempt + 1) * 5   # 5s, 10s, 15s, 20s, 25s
+            if attempt < retries - 1:
+                logger.warning(f"⚠️ DB connection failed (attempt {attempt+1}/{retries}), "
+                               f"retrying in {wait}s… ({e})")
+                time.sleep(wait)
+            else:
+                logger.error(f"❌ Could not connect to database after {retries} attempts")
+                raise
 
 
 @contextmanager
-def get_conn():
+def get_conn(retries: int = 3):
     """
     Yield a pooled connection.
     Commits on clean exit, rolls back on exception.
+    Retries up to `retries` times on OperationalError (e.g. brief DB hiccup).
     Always returns the connection to the pool.
     """
     if _pool is None:
         raise RuntimeError("Call db.init_pool() before using get_conn()")
-    conn = _pool.getconn()
-    # Reset connection state — guards against a previously aborted transaction
-    # being silently reused from the pool.
-    try:
-        if conn.closed:
-            _pool.putconn(conn, close=True)
-            conn = _pool.getconn()
-        conn.autocommit = False
-        # If the connection is in an error state, roll it back before use
-        if conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
-            conn.rollback()
-    except Exception:
-        _pool.putconn(conn)
-        raise
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
+
+    last_error = None
+    for attempt in range(retries):
+        conn = _pool.getconn()
         try:
-            conn.rollback()
+            # Reset connection state — guards against a previously aborted
+            # transaction being silently reused from the pool.
+            if conn.closed:
+                _pool.putconn(conn, close=True)
+                conn = _pool.getconn()
+            conn.autocommit = False
+            if conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
+                conn.rollback()
+        except Exception as e:
+            _pool.putconn(conn)
+            raise
+
+        try:
+            yield conn
+            conn.commit()
+            return                      # success — exit retry loop
+        except psycopg2.OperationalError as e:
+            # Transient DB error — roll back, return connection, wait and retry
+            last_error = e
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _pool.putconn(conn)
+            if attempt < retries - 1:
+                wait = (attempt + 1) * 2   # 2s, 4s
+                logger.warning(f"⚠️ DB operational error (attempt {attempt+1}/{retries}), "
+                               f"retrying in {wait}s… ({e})")
+                time.sleep(wait)
+            else:
+                logger.error(f"❌ DB query failed after {retries} attempts: {e}")
+                raise
         except Exception:
-            pass
-        raise
-    finally:
-        _pool.putconn(conn)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _pool.putconn(conn)
+            raise                       # non-transient error — don't retry
 
 
 def _cur(conn):
@@ -361,7 +399,22 @@ def post_stats(bot_id: str) -> dict:
         pending = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted=TRUE", (bot_id,))
         done = cur.fetchone()[0]
-    return {'total': total, 'pending': pending, 'posted': done}
+        
+        # Calculate database size
+        try:
+            cur.execute("SELECT pg_database_size(current_database())")
+            db_size_bytes = cur.fetchone()[0]
+            db_size_mb = db_size_bytes / (1024 * 1024)
+        except Exception:
+            # If pg_database_size fails (non-PostgreSQL or insufficient permissions), return 0
+            db_size_mb = 0.0
+        
+    return {
+        'total': total, 
+        'pending': pending, 
+        'posted': done,
+        'db_size_mb': db_size_mb
+    }
 
 
 def post_get_last(bot_id: str) -> dict | None:
