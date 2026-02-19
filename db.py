@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
-def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10,
+def init_pool(database_url: str, minconn: int = 2, maxconn: int = 20,
               retries: int = 5):
     """
     Connect to PostgreSQL with retry logic.
@@ -96,6 +96,7 @@ def get_conn(retries: int = 3):
         try:
             yield conn
             conn.commit()
+            _pool.putconn(conn)  # Return connection after success
             return                      # success — exit retry loop
         except psycopg2.OperationalError as e:
             # Transient DB error — roll back, return connection, wait and retry
