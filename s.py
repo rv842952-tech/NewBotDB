@@ -1607,6 +1607,36 @@ async def post_init(application: Application):
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
+
+
+async def lastpost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update): return
+    last = db.post_get_last(BOT_ID)
+    if not last:
+        await update.message.reply_text("No posts sent yet.", reply_markup=get_mode_keyboard())
+        return
+    
+    ist = utc_to_ist(last['scheduled_time'])
+    posted_ist = utc_to_ist(last['posted_at']) if last.get('posted_at') else None
+    
+    resp = f"📮 <b>LAST SENT POST</b>\n\n"
+    resp += f"🆔 ID: <b>#{last['id']}</b>\n"
+    resp += f"🕐 Scheduled: <b>{ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n"
+    if posted_ist:
+        resp += f"✅ Sent at: <b>{posted_ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n"
+    resp += f"📢 Channels: <b>{last['successful_posts']}/{last['total_channels']}</b>\n\n"
+    
+    if last.get('message'):
+        preview = last['message'][:100] + "..." if len(last['message']) > 100 else last['message']
+        resp += f"<b>Content:</b>\n{preview}"
+    elif last.get('media_type'):
+        resp += f"<b>Type:</b> {last['media_type']}"
+        if last.get('caption'):
+            preview = last['caption'][:100] + "..." if len(last['caption']) > 100 else last['caption']
+            resp += f"\n{preview}"
+    
+    await update.message.reply_text(resp, reply_markup=get_mode_keyboard(), parse_mode='HTML')
+
 def main():
     global BOT_ID, ADMIN_ID, AUTO_CLEANUP_MINUTES, posting_lock
 
