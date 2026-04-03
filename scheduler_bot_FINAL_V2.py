@@ -329,7 +329,14 @@ async def send_to_all_channels(bot, post: dict) -> int:
     # Apply send-time footer if convert mode is ON and post has text
     effective_message = post.get('message') or ''
     if _send_convert_on and _send_footer and effective_message:
-        effective_message = apply_footer(effective_message, _send_footer)
+        converted = apply_footer(effective_message, _send_footer)
+        if converted != effective_message:
+            logger.info(f"📤 Send footer applied to post #{post['id']}")
+        else:
+            logger.warning(f"⚠️ Send footer ON but no diskwala link in post #{post['id']} — sent as-is")
+        effective_message = converted
+    elif _send_convert_on and not _send_footer:
+        logger.warning(f"⚠️ Send convert ON but _send_footer empty — post #{post['id']} sent as-is")
 
     async def _do_send(ch_id: str):
         kw = dict(read_timeout=60, write_timeout=60, connect_timeout=60)
