@@ -78,29 +78,44 @@ ADMIN_ID: int = 0
 AUTO_CLEANUP_MINUTES: int = 30
 channel_ids: list[str] = []          # in-memory cache
 user_sessions: dict = {}
-# skip list: {channel_id: {'notified': bool}}
-_channel_skip_list: dict = {}
 posting_lock: asyncio.Lock = None    # created in main()
 
-# ─── Convert mode state ───────────────────────────────────────────────────────
-# Persisted to bot_settings.json so it survives restarts.
-_convert_mode: bool = False       # True = auto-convert & queue every post
-_convert_footer: str = ""         # fixed footer text set by admin via /setfooter
-_SETTINGS_FILE: str = "bot_settings.json"
+# ── skip list ─────────────────────────────────────────────────────────────────
+# {channel_id: {'notified': bool}} — TelegramError channels retried after main run
+_channel_skip_list: dict = {}
+
+# ── Convert Mode (send-time) ──────────────────────────────────────────────────
+# When ON: background poster applies _send_footer just before sending each post.
+# DB is never modified. Toggle any time without affecting pending queue.
+_send_convert_on: bool = False
+_send_footer:     str  = ""
+
+# ── Schedule Convert Mode ─────────────────────────────────────────────────────
+# When ON: every post collected during ANY scheduling flow gets _sched_footer
+# baked in before being saved to DB. Pending posts already in queue untouched.
+_sched_convert_on: bool = False
+_sched_footer:     str  = ""
+
+_SETTINGS_FILE = "bot_settings.json"
 
 def _load_settings():
-    global _convert_mode, _convert_footer
+    global _send_convert_on, _send_footer, _sched_convert_on, _sched_footer
     try:
-        with open(_SETTINGS_FILE) as f:
-            data = json.load(f)
-        _convert_mode   = data.get("convert_mode", False)
-        _convert_footer = data.get("convert_footer", "")
+        d = json.load(open(_SETTINGS_FILE))
+        _send_convert_on  = d.get("send_convert_on",  False)
+        _send_footer      = d.get("send_footer",      "")
+        _sched_convert_on = d.get("sched_convert_on", False)
+        _sched_footer     = d.get("sched_footer",     "")
     except (FileNotFoundError, json.JSONDecodeError):
-        pass  # first run, defaults are fine
+        pass
 
 def _save_settings():
-    with open(_SETTINGS_FILE, "w") as f:
-        json.dump({"convert_mode": _convert_mode, "convert_footer": _convert_footer}, f)
+    json.dump({
+        "send_convert_on":  _send_convert_on,
+        "send_footer":      _send_footer,
+        "sched_convert_on": _sched_convert_on,
+        "sched_footer":     _sched_footer,
+    }, open(_SETTINGS_FILE, "w"))
 
 
 
@@ -114,6 +129,7 @@ def _is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
 
 
+# ── Skip list helpers ─────────────────────────────────────────────────────────
 def add_to_skip_list(ch_id: str):
     if ch_id not in _channel_skip_list:
         _channel_skip_list[ch_id] = {'notified': False}
@@ -126,23 +142,17 @@ def is_in_skip_list(ch_id: str) -> bool:
     return ch_id in _channel_skip_list
 
 
-def convert_post(raw_text: str, footer: str) -> str | None:
+# ── Convert helper ────────────────────────────────────────────────────────────
+def apply_footer(text: str, footer: str) -> str:
     """
-    Extract all diskwala.com links from raw_text.
-    Keep everything up to and including the last diskwala link,
-    then append the fixed footer.
-    Returns None if no diskwala link found.
+    Keep everything up to and including the last diskwala.com link,
+    then append footer. Returns original text unchanged if no diskwala link found.
     """
     import re as _re
-    # find all diskwala URLs and their end positions in the text
-    pattern = _re.compile(r'https?://(?:www\.)?diskwala\.com/\S+')
-    matches = list(pattern.finditer(raw_text))
+    matches = list(_re.finditer(r'https?://(?:www\.)?diskwala\.com/\S+', text))
     if not matches:
-        return None
-
-    last_match = matches[-1]
-    # everything up to end of last diskwala link
-    head = raw_text[:last_match.end()].rstrip()
+        return text   # no link — return as-is, never block scheduling
+    head = text[:matches[-1].end()].rstrip()
     return head + "\n\n" + footer.strip()
 
 
@@ -150,14 +160,15 @@ def convert_post(raw_text: str, footer: str) -> str | None:
 # Keyboards
 # ─────────────────────────────────────────────
 def get_mode_keyboard():
-    convert_label = "🔴 Convert Mode: ON" if _convert_mode else "⚪ Convert Mode: OFF"
+    send_label  = "🔴 Send Footer: ON"  if _send_convert_on  else "⚪ Send Footer: OFF"
+    sched_label = "🟢 Sched Footer: ON" if _sched_convert_on else "⚪ Sched Footer: OFF"
     return ReplyKeyboardMarkup([
         [KeyboardButton("📦 Bulk Posts (Auto-Space)")],
         [KeyboardButton("🎯 Bulk Posts (Batches)")],
         [KeyboardButton("📆 Multi-Day Batch")],
         [KeyboardButton("📋 View Pending"), KeyboardButton("📊 Stats")],
         [KeyboardButton("📢 Channels"),     KeyboardButton("❌ Cancel")],
-        [KeyboardButton(convert_label)],
+        [KeyboardButton(send_label),        KeyboardButton(sched_label)],
     ], resize_keyboard=True)
 
 def get_bulk_collection_keyboard():
@@ -295,7 +306,11 @@ def extract_content(message) -> dict | None:
     c = {}
     if message.text and not message.text.startswith('/'):
         if not any(k in message.text for k in _BTN):
-            c['message'] = message.text
+            msg = message.text
+            # Apply schedule footer if sched convert mode is ON
+            if _sched_convert_on and _sched_footer:
+                msg = apply_footer(msg, _sched_footer)
+            c['message'] = msg
     if message.photo:
         c.update(media_type='photo',    media_file_id=message.photo[-1].file_id, caption=message.caption)
     elif message.video:
@@ -311,6 +326,11 @@ def extract_content(message) -> dict | None:
 async def send_to_all_channels(bot, post: dict) -> int:
     successful = 0
 
+    # Apply send-time footer if convert mode is ON and post has text
+    effective_message = post.get('message') or ''
+    if _send_convert_on and _send_footer and effective_message:
+        effective_message = apply_footer(effective_message, _send_footer)
+
     async def _do_send(ch_id: str):
         kw = dict(read_timeout=60, write_timeout=60, connect_timeout=60)
         if post['media_type'] == 'photo':
@@ -320,7 +340,7 @@ async def send_to_all_channels(bot, post: dict) -> int:
         elif post['media_type'] == 'document':
             await bot.send_document(ch_id, post['media_file_id'], caption=post['caption'], **kw)
         else:
-            await bot.send_message(ch_id, post['message'], **kw)
+            await bot.send_message(ch_id, effective_message, **kw)
 
     async def _send_with_retry(ch_id: str, max_retries: int = 5):
         for attempt in range(max_retries):
@@ -338,14 +358,16 @@ async def send_to_all_channels(bot, post: dict) -> int:
                 add_to_skip_list(ch_id)
                 return {'success': False, 'channel_id': ch_id, 'skip_listed': True}
 
-    # Phase 1: send to all active (non-skip-listed) channels
-    active_chs       = [ch for ch in channel_ids if not is_in_skip_list(ch)]
+    # Phase 1: all active (non-skip-listed) channels
+    active_chs        = [ch for ch in channel_ids if not is_in_skip_list(ch)]
     newly_skip_listed = []
     network_failed    = []
     send_batch        = 20
 
     for i in range(0, len(active_chs), send_batch):
-        results = await asyncio.gather(*[_send_with_retry(ch) for ch in active_chs[i:i+send_batch]])
+        results = await asyncio.gather(
+            *[_send_with_retry(ch) for ch in active_chs[i:i+send_batch]]
+        )
         for r in results:
             if r['success']:
                 successful += 1
@@ -369,12 +391,16 @@ async def send_to_all_channels(bot, post: dict) -> int:
                 pass  # stays in skip list, admin already notified
 
     db.post_mark_sent(BOT_ID, post['id'], successful)
-    logger.info(f"📊 Post {post['id']}: {successful}/{len(channel_ids)} | skip-listed: {len(_channel_skip_list)}")
+    logger.info(
+        f"📊 Post {post['id']}: {successful}/{len(channel_ids)} | "
+        f"send_footer={'ON' if _send_convert_on else 'OFF'} | "
+        f"skip-listed: {len(_channel_skip_list)}"
+    )
 
     if not ADMIN_ID:
         return successful
 
-    # Notify admin once per newly skip-listed channel
+    # Notify once per newly skip-listed channel
     for ch_id in newly_skip_listed:
         if ch_id in _channel_skip_list and not _channel_skip_list[ch_id]['notified']:
             try:
@@ -402,7 +428,7 @@ async def send_to_all_channels(bot, post: dict) -> int:
                 parse_mode='HTML'
             )
         except Exception as e:
-            logger.error(f"Failed to notify admin network failures: {e}")
+            logger.error(f"Failed to notify admin: {e}")
 
     return successful
 
@@ -755,7 +781,6 @@ async def _schedule_exautocont(update, session):
         post_idx += len(batch_posts)
         current_time += timedelta(minutes=interval_min)
 
-        # Check if we need to move to next day
         current_ist = utc_to_ist(current_time)
         if session['exautocont_window_is_duration']:
             window_start_ist = datetime.combine(anchor_date, datetime.min.time()) + timedelta(hours=daily_start_h)
@@ -874,35 +899,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "📢 Channels" in text: await channels_command(update, context); return
     if "📋 View"   in text: await list_posts(update, context); return
     if "❌" in text or text.lower() == "cancel": await cancel(update, context); return
-    if "Convert Mode" in text: await convertmode_command(update, context); return
-
-    # ── Convert mode: intercept every post, convert & queue it ───────────────
-    if _convert_mode and sess['step'] == 'choose_mode':
-        if not _convert_footer:
-            await update.message.reply_text(
-                "❌ Convert mode is ON but no footer set. Use /setfooter first.",
-                reply_markup=get_mode_keyboard())
-            return
-        raw = update.message.text or ""
-        if not raw or raw.startswith('/'):
-            pass  # let commands through normally
-        else:
-            converted = convert_post(raw, _convert_footer)
-            if converted is None:
-                await update.message.reply_text(
-                    "⚠️ No diskwala.com link found in this post. Not added to queue.",
-                    reply_markup=get_mode_keyboard())
-                return
-            # schedule immediately at now (will be sent by background poster)
-            # use utc_now so it fires on the next background_poster tick
-            t = utc_now()
-            pid = db.post_insert(BOT_ID, t, len(channel_ids),
-                                 converted, None, None, None)
-            await update.message.reply_text(
-                f"✅ <b>Converted & queued!</b>  🆔 #{pid}\n\n"
-                f"<b>Preview:</b>\n<code>{converted[:300]}{'...' if len(converted)>300 else ''}</code>",
-                reply_markup=get_mode_keyboard(), parse_mode='HTML')
-            return
+    if "Send Footer" in text: await toggle_send_convert(update, context); return
+    if "Sched Footer" in text: await convert_command(update, context); return
 
     def _no_ch():
         return len(channel_ids) == 0
@@ -1723,94 +1721,97 @@ async def post_init(application: Application):
 
 
 
-async def setfooter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─────────────────────────────────────────────
+# Send Footer commands  (Convert Mode button)
+# ─────────────────────────────────────────────
+async def toggle_send_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update): return
-    global _convert_footer
-    footer = update.message.text.replace('/setfooter', '', 1).strip()
-    if not footer:
+    global _send_convert_on
+    if not _send_footer:
         await update.message.reply_text(
-            "❌ Usage: send your footer text right after the command.\n\n"
-            "Example:\n<code>/setfooter 💋Ullu Webseries😍\nhttps://t.me/+xxx</code>",
-            reply_markup=get_mode_keyboard(), parse_mode='HTML')
-        return
-
-    _convert_footer = footer
-    _save_settings()
-
-    # ── Retroactively update all pending posts that have a diskwala link ──────
-    pending = db.post_get_pending(BOT_ID)
-    updated = 0
-    skipped = 0
-
-    if pending:
-        try:
-            import psycopg2
-            DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
-            conn = psycopg2.connect(DATABASE_URL)
-            conn.autocommit = True
-            cur = conn.cursor()
-
-            for post in pending:
-                msg = post.get('message') or ''
-                if not msg:
-                    skipped += 1
-                    continue
-                converted = convert_post(msg, footer)
-                if converted is None:
-                    skipped += 1
-                    continue
-                cur.execute(
-                    "UPDATE posts SET message = %s WHERE id = %s AND bot_id = %s",
-                    (converted, post['id'], BOT_ID)
-                )
-                updated += 1
-
-            cur.close()
-            conn.close()
-        except Exception as e:
-            logger.error(f"Failed to retroactively update posts: {e}")
-            await update.message.reply_text(
-                f"✅ Footer saved but failed to update pending posts: <code>{e}</code>",
-                reply_markup=get_mode_keyboard(), parse_mode='HTML')
-            return
-
-    preview = footer[:200] + ("..." if len(footer) > 200 else "")
-    resp = f"✅ <b>Footer saved!</b>\n\n"
-    if pending:
-        resp += f"♻️ Updated <b>{updated}</b> pending posts with new footer\n"
-        if skipped:
-            resp += f"⏭️ Skipped <b>{skipped}</b> posts (no diskwala link / media)\n"
-        resp += "\n"
-    resp += f"<b>New footer preview:</b>\n<code>{preview}</code>"
-    await update.message.reply_text(resp, reply_markup=get_mode_keyboard(), parse_mode='HTML')
-
-
-async def showfooter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update): return
-    if not _convert_footer:
-        await update.message.reply_text(
-            "❌ No footer set yet. Use /setfooter to set one.",
+            "❌ Set a send footer first with /setsendfooter",
             reply_markup=get_mode_keyboard())
         return
+    _send_convert_on = not _send_convert_on
+    _save_settings()
+    status = "🔴 ON" if _send_convert_on else "⚪ OFF"
     await update.message.reply_text(
-        f"📋 <b>Current footer:</b>\n\n{_convert_footer}",
+        f"📤 <b>Send Footer: {status}</b>\n\n"
+        f"{'All outgoing posts will have the send footer applied at send time. DB is untouched.' if _send_convert_on else 'Outgoing posts will go as stored in DB.'}",
+        reply_markup=get_mode_keyboard(), parse_mode='HTML')
+
+async def setsendfooter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update): return
+    global _send_footer
+    footer = update.message.text.replace('/setsendfooter', '', 1).strip()
+    if not footer:
+        await update.message.reply_text(
+            "❌ Usage: <code>/setsendfooter your footer text here</code>",
+            reply_markup=get_mode_keyboard(), parse_mode='HTML')
+        return
+    _send_footer = footer
+    _save_settings()
+    preview = footer[:300] + ("..." if len(footer) > 300 else "")
+    await update.message.reply_text(
+        f"✅ <b>Send footer saved!</b>\n\n<code>{preview}</code>",
+        reply_markup=get_mode_keyboard(), parse_mode='HTML')
+
+async def showsendfooter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update): return
+    if not _send_footer:
+        await update.message.reply_text("❌ No send footer set. Use /setsendfooter", reply_markup=get_mode_keyboard())
+        return
+    status = "🔴 ON" if _send_convert_on else "⚪ OFF"
+    await update.message.reply_text(
+        f"📤 <b>Send Footer</b> [{status}]\n\n{_send_footer}",
         reply_markup=get_mode_keyboard(), parse_mode='HTML')
 
 
-async def convertmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─────────────────────────────────────────────
+# Schedule Footer commands  (/convert toggle)
+# ─────────────────────────────────────────────
+async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle schedule-time footer ON/OFF."""
     if not _is_admin(update): return
-    global _convert_mode
-    if not _convert_footer:
+    global _sched_convert_on
+    if not _sched_footer:
         await update.message.reply_text(
-            "❌ Set a footer first with /setfooter before enabling convert mode.",
+            "❌ Set a schedule footer first with /setschedfooter",
             reply_markup=get_mode_keyboard())
         return
-    _convert_mode = not _convert_mode
+    _sched_convert_on = not _sched_convert_on
     _save_settings()
-    status = "🔴 ON" if _convert_mode else "⚪ OFF"
-    msg = (f"🔄 <b>Convert Mode: {status}</b>\n\n"
-           f"{'Every post you send will be auto-converted and added to the queue.' if _convert_mode else 'Bot is back to normal scheduling mode.'}")
-    await update.message.reply_text(msg, reply_markup=get_mode_keyboard(), parse_mode='HTML')
+    status = "🟢 ON" if _sched_convert_on else "⚪ OFF"
+    await update.message.reply_text(
+        f"📅 <b>Schedule Footer: {status}</b>\n\n"
+        f"{'Posts collected during scheduling will have the schedule footer baked in before saving to DB.' if _sched_convert_on else 'Posts will be scheduled as-is, no footer applied.'}",
+        reply_markup=get_mode_keyboard(), parse_mode='HTML')
+
+async def setschedfooter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update): return
+    global _sched_footer
+    footer = update.message.text.replace('/setschedfooter', '', 1).strip()
+    if not footer:
+        await update.message.reply_text(
+            "❌ Usage: <code>/setschedfooter your footer text here</code>",
+            reply_markup=get_mode_keyboard(), parse_mode='HTML')
+        return
+    _sched_footer = footer
+    _save_settings()
+    preview = footer[:300] + ("..." if len(footer) > 300 else "")
+    await update.message.reply_text(
+        f"✅ <b>Schedule footer saved!</b>\n\n<code>{preview}</code>",
+        reply_markup=get_mode_keyboard(), parse_mode='HTML')
+
+async def showschedfooter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update): return
+    if not _sched_footer:
+        await update.message.reply_text("❌ No schedule footer set. Use /setschedfooter", reply_markup=get_mode_keyboard())
+        return
+    status = "🟢 ON" if _sched_convert_on else "⚪ OFF"
+    await update.message.reply_text(
+        f"📅 <b>Schedule Footer</b> [{status}]\n\n{_sched_footer}",
+        reply_markup=get_mode_keyboard(), parse_mode='HTML')
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1851,7 +1852,7 @@ async def lastpost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if hasattr(t, 'tzinfo') and t.tzinfo:
         t = t.replace(tzinfo=None)
     ist = utc_to_ist(t)
-    resp = f"📮 <b>LAST PENDING POST</b>\n\n"
+    resp  = f"📮 <b>LAST PENDING POST</b>\n\n"
     resp += f"🆔 ID: <b>#{last['id']}</b>\n"
     resp += f"🕐 Scheduled: <b>{ist.strftime('%Y-%m-%d %H:%M')} IST</b>\n"
     resp += f"📋 Position: <b>#{len(pending)} in queue</b>\n\n"
@@ -1917,9 +1918,11 @@ def main():
     app.add_handler(CommandHandler("backup",         backup_posts_command))
     app.add_handler(CommandHandler("debug",          debug_command))
     app.add_handler(CommandHandler("lastpost",       lastpost_command))
-    app.add_handler(CommandHandler("setfooter",      setfooter_command))
-    app.add_handler(CommandHandler("showfooter",     showfooter_command))
-    app.add_handler(CommandHandler("convertmode",    convertmode_command))
+    app.add_handler(CommandHandler("convert",        convert_command))
+    app.add_handler(CommandHandler("setsendfooter",  setsendfooter_command))
+    app.add_handler(CommandHandler("showsendfooter", showsendfooter_command))
+    app.add_handler(CommandHandler("setschedfooter", setschedfooter_command))
+    app.add_handler(CommandHandler("showschedfooter",showschedfooter_command))
     app.add_handler(MessageHandler(filters.ALL,      handle_message))
 
     logger.info("=" * 60)
