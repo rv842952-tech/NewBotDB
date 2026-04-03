@@ -145,15 +145,35 @@ def is_in_skip_list(ch_id: str) -> bool:
 # ── Convert helper ────────────────────────────────────────────────────────────
 def apply_footer(text: str, footer: str) -> str:
     """
-    Keep everything up to and including the last diskwala.com link,
-    then append footer. Returns original text unchanged if no diskwala link found.
+    Keep head up to and including the diskwala.com link, replace all promo links
+    after it with footer, but preserve the 'How To Watch' block if present.
+    Returns original text unchanged if no diskwala link found.
     """
     import re as _re
     matches = list(_re.finditer(r'https?://(?:www\.)?diskwala\.com/\S+', text))
     if not matches:
         return text   # no link — return as-is, never block scheduling
     head = text[:matches[-1].end()].rstrip()
-    return head + "\n\n" + footer.strip()
+    tail_raw = text[matches[-1].end():]
+    # Only preserve the "How To Watch" block (label line + how_to_watch t.me link)
+    preserved = []
+    lines = tail_raw.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if not stripped:
+            i += 1
+            continue
+        next_stripped = lines[i + 1].strip() if i + 1 < len(lines) else ''
+        if (not _re.match(r'^https?://', stripped) and
+                _re.match(r'^https?://t\.me/how_to_watch', next_stripped, _re.IGNORECASE)):
+            preserved.append(stripped)
+            preserved.append(next_stripped)
+            i += 2
+            continue
+        i += 1
+    tail = ("\n" + "\n".join(preserved)) if preserved else ""
+    return head + "\n\n" + footer.strip() + tail
 
 
 # ─────────────────────────────────────────────
@@ -312,11 +332,20 @@ def extract_content(message) -> dict | None:
                 msg = apply_footer(msg, _sched_footer)
             c['message'] = msg
     if message.photo:
-        c.update(media_type='photo',    media_file_id=message.photo[-1].file_id, caption=message.caption)
+        cap = message.caption or ''
+        if _sched_convert_on and _sched_footer and cap:
+            cap = apply_footer(cap, _sched_footer)
+        c.update(media_type='photo',    media_file_id=message.photo[-1].file_id, caption=cap or None)
     elif message.video:
-        c.update(media_type='video',    media_file_id=message.video.file_id,     caption=message.caption)
+        cap = message.caption or ''
+        if _sched_convert_on and _sched_footer and cap:
+            cap = apply_footer(cap, _sched_footer)
+        c.update(media_type='video',    media_file_id=message.video.file_id,     caption=cap or None)
     elif message.document:
-        c.update(media_type='document', media_file_id=message.document.file_id,  caption=message.caption)
+        cap = message.caption or ''
+        if _sched_convert_on and _sched_footer and cap:
+            cap = apply_footer(cap, _sched_footer)
+        c.update(media_type='document', media_file_id=message.document.file_id,  caption=cap or None)
     return c if c else None
 
 
@@ -338,14 +367,23 @@ async def send_to_all_channels(bot, post: dict) -> int:
     elif _send_convert_on and not _send_footer:
         logger.warning(f"⚠️ Send convert ON but _send_footer empty — post #{post['id']} sent as-is")
 
+    # Apply send-time footer to media caption too
+    effective_caption = post.get('caption') or ''
+    if _send_convert_on and _send_footer and effective_caption:
+        converted_cap = apply_footer(effective_caption, _send_footer)
+        if converted_cap != effective_caption:
+            logger.info(f"📤 Send footer applied to caption of post #{post['id']}")
+        effective_caption = converted_cap
+    effective_caption = effective_caption or None
+
     async def _do_send(ch_id: str):
         kw = dict(read_timeout=60, write_timeout=60, connect_timeout=60)
         if post['media_type'] == 'photo':
-            await bot.send_photo(ch_id, post['media_file_id'], caption=post['caption'], **kw)
+            await bot.send_photo(ch_id, post['media_file_id'], caption=effective_caption, **kw)
         elif post['media_type'] == 'video':
-            await bot.send_video(ch_id, post['media_file_id'], caption=post['caption'], **kw)
+            await bot.send_video(ch_id, post['media_file_id'], caption=effective_caption, **kw)
         elif post['media_type'] == 'document':
-            await bot.send_document(ch_id, post['media_file_id'], caption=post['caption'], **kw)
+            await bot.send_document(ch_id, post['media_file_id'], caption=effective_caption, **kw)
         else:
             await bot.send_message(ch_id, effective_message, **kw)
 
