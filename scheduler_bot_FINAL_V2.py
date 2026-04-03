@@ -15,6 +15,7 @@ ENV VARS
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -145,8 +146,7 @@ def is_in_skip_list(ch_id: str) -> bool:
 # ── Convert helper ────────────────────────────────────────────────────────────
 def apply_footer(text: str, footer: str) -> str:
     """
-    Keep head up to and including the diskwala.com link, replace all promo links
-    after it with footer, but preserve the 'How To Watch' block if present.
+    Remove everything after the last diskwala.com link and replace with footer.
     Returns original text unchanged if no diskwala link found.
     """
     import re as _re
@@ -154,26 +154,7 @@ def apply_footer(text: str, footer: str) -> str:
     if not matches:
         return text   # no link — return as-is, never block scheduling
     head = text[:matches[-1].end()].rstrip()
-    tail_raw = text[matches[-1].end():]
-    # Only preserve the "How To Watch" block (label line + how_to_watch t.me link)
-    preserved = []
-    lines = tail_raw.splitlines()
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        if not stripped:
-            i += 1
-            continue
-        next_stripped = lines[i + 1].strip() if i + 1 < len(lines) else ''
-        if (not _re.match(r'^https?://', stripped) and
-                _re.match(r'^https?://t\.me/how_to_watch', next_stripped, _re.IGNORECASE)):
-            preserved.append(stripped)
-            preserved.append(next_stripped)
-            i += 2
-            continue
-        i += 1
-    tail = ("\n" + "\n".join(preserved)) if preserved else ""
-    return head + "\n\n" + footer.strip() + tail
+    return head + "\n\n" + footer.strip()
 
 
 # ─────────────────────────────────────────────
@@ -263,7 +244,6 @@ def get_time_of_day_keyboard():
 # Time parsing
 # ─────────────────────────────────────────────
 import re
-import json
 
 def parse_duration_to_minutes(text: str) -> int:
     text = text.strip().lower()
