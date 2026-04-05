@@ -15,7 +15,6 @@ ENV VARS
 """
 
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -97,26 +96,60 @@ _send_footer:     str  = ""
 _sched_convert_on: bool = False
 _sched_footer:     str  = ""
 
-_SETTINGS_FILE = "bot_settings.json"
+def _bootstrap_settings_table():
+    """Create bot_settings table if it doesn't exist."""
+    with db.get_conn() as conn:
+        conn.cursor().execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                bot_id  TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (bot_id, key)
+            )
+        """)
+    logger.info("✅ bot_settings table ready")
 
 def _load_settings():
     global _send_convert_on, _send_footer, _sched_convert_on, _sched_footer
+    if not BOT_ID:
+        return  # called before BOT_ID is set — skip (will be called again after init)
     try:
-        d = json.load(open(_SETTINGS_FILE))
-        _send_convert_on  = d.get("send_convert_on",  False)
-        _send_footer      = d.get("send_footer",      "")
-        _sched_convert_on = d.get("sched_convert_on", False)
-        _sched_footer     = d.get("sched_footer",     "")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        with db.get_conn() as conn:
+            cur = conn.cursor(cursor_factory=__import__('psycopg2').extras.RealDictCursor)
+            cur.execute(
+                "SELECT key, value FROM bot_settings WHERE bot_id = %s",
+                (BOT_ID,)
+            )
+            rows = {row['key']: row['value'] for row in cur.fetchall()}
+        _send_convert_on  = rows.get("send_convert_on",  "0") == "1"
+        _send_footer      = rows.get("send_footer",      "")
+        _sched_convert_on = rows.get("sched_convert_on", "0") == "1"
+        _sched_footer     = rows.get("sched_footer",     "")
+        logger.info(f"✅ Settings loaded from DB — send_footer={'ON' if _send_convert_on else 'OFF'}, sched_footer={'ON' if _sched_convert_on else 'OFF'}")
+    except Exception as e:
+        logger.error(f"Failed to load settings from DB: {e}")
 
 def _save_settings():
-    json.dump({
-        "send_convert_on":  _send_convert_on,
+    if not BOT_ID:
+        return
+    data = {
+        "send_convert_on":  "1" if _send_convert_on  else "0",
         "send_footer":      _send_footer,
-        "sched_convert_on": _sched_convert_on,
+        "sched_convert_on": "1" if _sched_convert_on else "0",
         "sched_footer":     _sched_footer,
-    }, open(_SETTINGS_FILE, "w"))
+    }
+    try:
+        with db.get_conn() as conn:
+            cur = conn.cursor()
+            for key, value in data.items():
+                cur.execute("""
+                    INSERT INTO bot_settings (bot_id, key, value)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (bot_id, key) DO UPDATE SET value = EXCLUDED.value
+                """, (BOT_ID, key, value))
+        logger.info("✅ Settings saved to DB")
+    except Exception as e:
+        logger.error(f"Failed to save settings to DB: {e}")
 
 
 
@@ -1908,12 +1941,14 @@ def main():
 
     CHANNEL_IDS = [c.strip() for c in os.environ.get('CHANNEL_IDS', '').split(',') if c.strip()]
 
-    _load_settings()
     db.init_pool(DATABASE_URL, minconn=2, maxconn=10)
     db.bootstrap_schema()
 
     BOT_ID = db.make_bot_id(BOT_TOKEN)
     db.register_tenant(BOT_ID, 'scheduler')
+
+    _bootstrap_settings_table()
+    _load_settings()
 
     for cid in CHANNEL_IDS:
         db.channel_add(BOT_ID, cid)
