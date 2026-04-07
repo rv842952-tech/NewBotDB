@@ -204,12 +204,10 @@ CREATE TABLE IF NOT EXISTS forward_log (
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_posts_due
-    ON posts (bot_id, scheduled_time, posted)
-    WHERE posted = 0;
+    ON posts (bot_id, scheduled_time, posted);
 
 CREATE INDEX IF NOT EXISTS idx_channels_active
-    ON channels (bot_id, active)
-    WHERE active = 1;
+    ON channels (bot_id, active);
 
 CREATE INDEX IF NOT EXISTS idx_fwdlog_bot
     ON forward_log (bot_id, forwarded_at DESC);
@@ -218,28 +216,25 @@ CREATE INDEX IF NOT EXISTS idx_fwdlog_bot
 
 def bootstrap_schema():
     """Create all tables if they don't exist. Safe to call concurrently."""
+    _migrate_boolean_to_integer()  # run BEFORE schema so indexes don't fail
     with get_conn() as conn:
         conn.cursor().execute(_SCHEMA_SQL)
     logger.info("✅ Schema bootstrapped")
-    _migrate_boolean_to_integer()
 
 
 def _migrate_boolean_to_integer():
     """
-    One-time migration: convert posted (BOOLEAN) -> INTEGER and
-    active (BOOLEAN) -> INTEGER so both single-file and multi-file
-    bots can share the same database without type-mismatch errors.
-    Safe to call on every startup — ALTER TYPE is a no-op if already INTEGER.
+    Convert posted (BOOLEAN) and active (BOOLEAN) to INTEGER.
+    Runs before _SCHEMA_SQL so partial index creation never hits type mismatch.
+    Safe to call every startup — does nothing if already INTEGER.
     """
     migrations = [
-        # Convert posted column: FALSE->0, TRUE->1
         """
         DO $$
         BEGIN
             IF EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'posts'
-                AND column_name = 'posted'
+                WHERE table_name = 'posts' AND column_name = 'posted'
                 AND data_type = 'boolean'
             ) THEN
                 ALTER TABLE posts
@@ -249,14 +244,12 @@ def _migrate_boolean_to_integer():
             END IF;
         END $$;
         """,
-        # Convert active column in channels: FALSE->0, TRUE->1
         """
         DO $$
         BEGIN
             IF EXISTS (
                 SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'channels'
-                AND column_name = 'active'
+                WHERE table_name = 'channels' AND column_name = 'active'
                 AND data_type = 'boolean'
             ) THEN
                 ALTER TABLE channels
@@ -266,33 +259,15 @@ def _migrate_boolean_to_integer():
             END IF;
         END $$;
         """,
-        # Drop the partial index that used boolean WHERE clause and recreate it
-        """
-        DROP INDEX IF EXISTS idx_posts_due;
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_posts_due
-            ON posts (bot_id, scheduled_time, posted)
-            WHERE posted = 0;
-        """,
-        # Same for channels active index
-        """
-        DROP INDEX IF EXISTS idx_channels_active;
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_channels_active
-            ON channels (bot_id, active)
-            WHERE active = 1;
-        """,
     ]
     try:
         with get_conn() as conn:
             cur = conn.cursor()
             for sql in migrations:
                 cur.execute(sql)
-        logger.info("✅ Boolean→Integer migration complete (or already done)")
+        logger.info("✅ Boolean→Integer migration done (or already integer)")
     except Exception as e:
-        logger.error(f"Migration error (non-fatal): {e}")
+        logger.warning(f"Migration note (non-fatal): {e}")
 
 
 def register_tenant(bot_id: str, bot_type: str):
@@ -330,7 +305,7 @@ def channel_remove(bot_id: str, channel_id: str) -> bool:
     with get_conn() as conn:
         cur = _raw(conn)
         cur.execute(
-            "UPDATE channels SET active=0 WHERE bot_id=%s AND channel_id=%s",
+            "UPDATE channels SET active = 0 WHERE bot_id=%s AND channel_id=%s",
             (bot_id, channel_id)
         )
         return cur.rowcount > 0
@@ -340,7 +315,7 @@ def channel_list_active(bot_id: str) -> list[str]:
     with get_conn() as conn:
         cur = _cur(conn)
         cur.execute(
-            "SELECT channel_id FROM channels WHERE bot_id=%s AND active=1 ORDER BY channel_id",
+            "SELECT channel_id FROM channels WHERE bot_id=%s AND active = 1 ORDER BY channel_id",
             (bot_id,)
         )
         return [r['channel_id'] for r in cur.fetchall()]
