@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS posts (
     media_file_id    TEXT,
     caption          TEXT,
     scheduled_time   TIMESTAMPTZ NOT NULL,
-    posted           BOOLEAN     DEFAULT FALSE,
+    posted           INTEGER     DEFAULT 0,
     total_channels   INT         DEFAULT 0,
     successful_posts INT         DEFAULT 0,
     posted_at        TIMESTAMPTZ,
@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS channels (
     channel_id     TEXT        NOT NULL,
     channel_name   TEXT,
     added_at       TIMESTAMPTZ DEFAULT NOW(),
-    active         BOOLEAN     DEFAULT TRUE,
+    active         INTEGER     DEFAULT 1,
     total_forwards BIGINT      DEFAULT 0,
     last_forward   TIMESTAMPTZ,
     UNIQUE (bot_id, channel_id)          -- two bots can share same target
@@ -205,11 +205,11 @@ CREATE TABLE IF NOT EXISTS forward_log (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_posts_due
     ON posts (bot_id, scheduled_time, posted)
-    WHERE posted = FALSE;
+    WHERE posted = 0;
 
 CREATE INDEX IF NOT EXISTS idx_channels_active
     ON channels (bot_id, active)
-    WHERE active = TRUE;
+    WHERE active = 1;
 
 CREATE INDEX IF NOT EXISTS idx_fwdlog_bot
     ON forward_log (bot_id, forwarded_at DESC);
@@ -221,6 +221,78 @@ def bootstrap_schema():
     with get_conn() as conn:
         conn.cursor().execute(_SCHEMA_SQL)
     logger.info("✅ Schema bootstrapped")
+    _migrate_boolean_to_integer()
+
+
+def _migrate_boolean_to_integer():
+    """
+    One-time migration: convert posted (BOOLEAN) -> INTEGER and
+    active (BOOLEAN) -> INTEGER so both single-file and multi-file
+    bots can share the same database without type-mismatch errors.
+    Safe to call on every startup — ALTER TYPE is a no-op if already INTEGER.
+    """
+    migrations = [
+        # Convert posted column: FALSE->0, TRUE->1
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'posts'
+                AND column_name = 'posted'
+                AND data_type = 'boolean'
+            ) THEN
+                ALTER TABLE posts
+                    ALTER COLUMN posted TYPE INTEGER
+                    USING CASE WHEN posted THEN 1 ELSE 0 END;
+                ALTER TABLE posts ALTER COLUMN posted SET DEFAULT 0;
+            END IF;
+        END $$;
+        """,
+        # Convert active column in channels: FALSE->0, TRUE->1
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'channels'
+                AND column_name = 'active'
+                AND data_type = 'boolean'
+            ) THEN
+                ALTER TABLE channels
+                    ALTER COLUMN active TYPE INTEGER
+                    USING CASE WHEN active THEN 1 ELSE 0 END;
+                ALTER TABLE channels ALTER COLUMN active SET DEFAULT 1;
+            END IF;
+        END $$;
+        """,
+        # Drop the partial index that used boolean WHERE clause and recreate it
+        """
+        DROP INDEX IF EXISTS idx_posts_due;
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_posts_due
+            ON posts (bot_id, scheduled_time, posted)
+            WHERE posted = 0;
+        """,
+        # Same for channels active index
+        """
+        DROP INDEX IF EXISTS idx_channels_active;
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_channels_active
+            ON channels (bot_id, active)
+            WHERE active = 1;
+        """,
+    ]
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            for sql in migrations:
+                cur.execute(sql)
+        logger.info("✅ Boolean→Integer migration complete (or already done)")
+    except Exception as e:
+        logger.error(f"Migration error (non-fatal): {e}")
 
 
 def register_tenant(bot_id: str, bot_type: str):
@@ -248,7 +320,7 @@ def channel_add(bot_id: str, channel_id: str, channel_name: str | None = None) -
             VALUES (%s, %s, %s, TRUE)
             ON CONFLICT (bot_id, channel_id)
             DO UPDATE SET
-                active       = TRUE,
+                active       = 1,
                 channel_name = COALESCE(EXCLUDED.channel_name, channels.channel_name)
         """, (bot_id, channel_id, channel_name))
     return True
@@ -258,7 +330,7 @@ def channel_remove(bot_id: str, channel_id: str) -> bool:
     with get_conn() as conn:
         cur = _raw(conn)
         cur.execute(
-            "UPDATE channels SET active=FALSE WHERE bot_id=%s AND channel_id=%s",
+            "UPDATE channels SET active=0 WHERE bot_id=%s AND channel_id=%s",
             (bot_id, channel_id)
         )
         return cur.rowcount > 0
@@ -268,7 +340,7 @@ def channel_list_active(bot_id: str) -> list[str]:
     with get_conn() as conn:
         cur = _cur(conn)
         cur.execute(
-            "SELECT channel_id FROM channels WHERE bot_id=%s AND active=TRUE ORDER BY channel_id",
+            "SELECT channel_id FROM channels WHERE bot_id=%s AND active=1 ORDER BY channel_id",
             (bot_id,)
         )
         return [r['channel_id'] for r in cur.fetchall()]
@@ -326,7 +398,7 @@ def post_get_due(bot_id: str, limit: int = 200) -> list[dict]:
             SELECT * FROM posts
             WHERE  bot_id = %s
               AND  scheduled_time <= NOW()
-              AND  posted = FALSE
+              AND  posted = 0
             ORDER  BY scheduled_time
             LIMIT  %s
         """, (bot_id, limit))
@@ -337,7 +409,7 @@ def post_mark_sent(bot_id: str, post_id: int, successful: int):
     with get_conn() as conn:
         _raw(conn).execute("""
             UPDATE posts
-            SET    posted = TRUE,
+            SET    posted = 1,
                    posted_at = NOW(),
                    successful_posts = %s
             WHERE  id = %s AND bot_id = %s
@@ -349,7 +421,7 @@ def post_get_pending(bot_id: str) -> list[dict]:
         cur = _cur(conn)
         cur.execute("""
             SELECT * FROM posts
-            WHERE  bot_id = %s AND posted = FALSE
+            WHERE  bot_id = %s AND posted = 0
             ORDER  BY scheduled_time
         """, (bot_id,))
         return [dict(r) for r in cur.fetchall()]
@@ -369,7 +441,7 @@ def post_delete_pending_all(bot_id: str) -> int:
     with get_conn() as conn:
         cur = _raw(conn)
         cur.execute(
-            "DELETE FROM posts WHERE bot_id=%s AND posted=FALSE",
+            "DELETE FROM posts WHERE bot_id=%s AND posted = 0",
             (bot_id,)
         )
         return cur.rowcount
@@ -383,7 +455,7 @@ def post_cleanup_old(bot_id: str, minutes: int) -> int:
             f"""
             DELETE FROM posts
             WHERE  bot_id   = %s
-              AND  posted    = TRUE
+              AND  posted    = 1
               AND  posted_at < NOW() - INTERVAL '{int(minutes)} minutes'
             """,
             (bot_id,)
@@ -396,9 +468,9 @@ def post_stats(bot_id: str) -> dict:
         cur = _raw(conn)
         cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s", (bot_id,))
         total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted=FALSE", (bot_id,))
+        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted = 0", (bot_id,))
         pending = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted=TRUE", (bot_id,))
+        cur.execute("SELECT COUNT(*) FROM posts WHERE bot_id=%s AND posted = 1", (bot_id,))
         done = cur.fetchone()[0]
         
         # Calculate database size
@@ -425,7 +497,7 @@ def post_get_last(bot_id: str) -> dict | None:
         cur.execute("""
             SELECT *
             FROM   posts
-            WHERE  bot_id = %s AND posted = TRUE
+            WHERE  bot_id = %s AND posted = 1
             ORDER  BY posted_at DESC
             LIMIT  1
         """, (bot_id,))
